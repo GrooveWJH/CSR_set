@@ -1,0 +1,176 @@
+#include "helper.h"
+#include <climits>
+#include <cstdio>
+#include <cuda_runtime.h>
+#include <iostream>
+#include <vector>
+
+#define NNZ_PER_WG 1024
+#define ROWS_PER_WG 64    // Default rows per workgroup
+#define THREADS_PER_WG 64 // Default threads per workgroup
+
+__global__ void csrAdaptiveKernel() {}
+
+// CPU function: calculate row blocks (workgroups)
+void calculateRowBlocks(int totalRows, const std::vector<int> &row_delimiters,
+                        int localSize, std::vector<int> &rowBlocks) {
+  int tempSum = 0;
+  int lastIdx = 0;
+  int ctr = 1;
+  rowBlocks.push_back(0); // Start with 0th block
+
+  for (int i = 1; i < totalRows; i++) {
+    // Calculate non-zero elements in this row
+    tempSum += row_delimiters[i] - row_delimiters[i - 1];
+
+    // Check if the current block can handle this row
+    if (tempSum == localSize) {
+      rowBlocks.push_back(i);
+      ctr++;
+      tempSum = 0;
+    } else if (tempSum > localSize) {
+      if (i - lastIdx > 1) {
+        // This extra row doesn't fit into the current block
+        rowBlocks.push_back(i - 1);
+        ctr++;
+        i--; // Step back to the previous row
+      } else {
+        // If only one row is too large, put it in a separate block
+        rowBlocks.push_back(i);
+        ctr++;
+      }
+      tempSum = 0;
+    }
+    lastIdx = i;
+  }
+  rowBlocks.push_back(totalRows); // End with the last row
+}
+
+__global__ void csrStreamKernel(const float *values, const int *cols,
+                                const int *row_delimiters, const float *x,
+                                float *output, int totalRows,
+                                const int *rowBlocks) {
+  __shared__ float LDS[NNZ_PER_WG];
+
+  int workgroupID = blockIdx.x; // 当前工作组编号（即 blockIdx.x）
+  int localTid = threadIdx.x;   // 工作组内线程编号
+
+  // 从 rowBlocks 数组中获得当前工作组的行范围
+  int startRow = rowBlocks[workgroupID];         // 当前工作组起始行
+  int nextStartRow = rowBlocks[workgroupID + 1]; // 下一个工作组的起始行
+  int numRows = nextStartRow - startRow;         // 当前工作组内行数
+
+  int effectiveThreads = (numRows < THREADS_PER_WG) ? numRows : THREADS_PER_WG;
+
+  int numNonZeroes = row_delimiters[nextStartRow] - row_delimiters[startRow];
+
+  // stride with effctiveThreads
+  for (int i = localTid; i < numNonZeroes; i += effectiveThreads) {
+    int idx = row_delimiters[startRow] + i;
+    LDS[i] = values[idx] * x[cols[idx]];
+  }
+
+  __syncthreads(); // 同步所有线程确保 LDS 数据加载完毕
+
+  // 只有有效线程执行归约计算
+  if (localTid < effectiveThreads) {
+    // 当前工作组非零元素在全局 row_delimiters 中的基准偏移
+    int base = row_delimiters[startRow];
+    // 将当前线程对应行的起始和结束索引转换为 LDS 内的相对索引
+    int localStart = row_delimiters[startRow + localTid] - base;
+    int localEnd = row_delimiters[startRow + localTid + 1] - base;
+
+    float temp = 0.0f;
+    for (int i = localStart; i < localEnd; i++) {
+      // 可选调试输出：
+      printf("B%dT%d: processing LDS[%d] = %f\n", workgroupID, localTid, i,
+             LDS[i]);
+      temp += LDS[i];
+    }
+    // 将归约结果写入输出数组，输出行索引与 rowBlocks 定义一致
+    output[startRow + localTid] = temp;
+  }
+}
+
+int main() {
+  std::cout << "start\n";
+
+  std::vector<float> values;
+  std::vector<int> cols;
+  std::vector<int> row_delimiters;
+
+  std::string matrix_filename =
+      "/home/groove/work/microsoft/CSR_set/data/csr_format.txt";
+  readMatrixFromFile(matrix_filename, values, cols, row_delimiters);
+  std::string vector_filename =
+      "/home/groove/work/microsoft/CSR_set/data/x.txt";
+  std::vector<float> x = readVectorFromFile(vector_filename);
+  std::vector<float> output(row_delimiters.size() - 1);
+
+  // Allocate memory on GPU
+
+  float *d_values, *d_x, *d_output;
+  int *d_cols, *d_row_delimiters;
+  int *d_rowBlocks;
+  int totalRows = row_delimiters.size() - 1;
+  // Calculate row blocks
+  std::vector<int> rowBlocks;
+  calculateRowBlocks(totalRows, row_delimiters, NNZ_PER_WG, rowBlocks);
+  std::cout << "Row blocks: ";
+  for (const auto &block : rowBlocks) {
+    std::cout << block << " ";
+  }
+  std::cout << std::endl;
+
+  cudaMalloc(&d_values, values.size() * sizeof(float));
+  cudaMalloc(&d_cols, cols.size() * sizeof(int));
+  cudaMalloc(&d_row_delimiters, row_delimiters.size() * sizeof(int));
+  cudaMalloc(&d_x, x.size() * sizeof(float));
+  cudaMalloc(&d_output, output.size() * sizeof(float));
+  cudaMalloc(&d_rowBlocks, rowBlocks.size() * sizeof(int));
+
+  // Copy data from host to device
+  cudaMemcpy(d_values, values.data(), values.size() * sizeof(float),
+             cudaMemcpyHostToDevice);
+  cudaMemcpy(d_cols, cols.data(), cols.size() * sizeof(int),
+             cudaMemcpyHostToDevice);
+  cudaMemcpy(d_row_delimiters, row_delimiters.data(),
+             row_delimiters.size() * sizeof(int), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_x, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_rowBlocks, rowBlocks.data(), rowBlocks.size() * sizeof(int),
+             cudaMemcpyHostToDevice);
+
+  // Launch CUDA kernel (launching 1 block, THREADS_PER_WG threads per block)
+  int numBlocks = rowBlocks.size() - 1;
+  printf("create B%d * T%d", numBlocks, THREADS_PER_WG);
+  csrStreamKernel<<<numBlocks, THREADS_PER_WG>>>(
+      d_values, d_cols, d_row_delimiters, d_x, d_output, totalRows,
+      d_rowBlocks);
+
+  cudaDeviceSynchronize();
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    std::cerr << "CUDA error: " << cudaGetErrorString(err) << std::endl;
+    return -1;
+  }
+
+  cudaMemcpy(output.data(), d_output, output.size() * sizeof(float),
+             cudaMemcpyDeviceToHost);
+
+  std::cout << "Output: ";
+  for (const auto &val : output) {
+    std::cout << val << " ";
+  }
+  std::cout << std::endl;
+
+  cudaFree(d_values);
+  cudaFree(d_cols);
+  cudaFree(d_row_delimiters);
+  cudaFree(d_x);
+  cudaFree(d_output);
+  cudaFree(d_rowBlocks);
+
+  std::cout << "done";
+  return 0;
+}
