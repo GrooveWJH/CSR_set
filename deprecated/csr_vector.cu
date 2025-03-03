@@ -16,13 +16,43 @@ int getMaxNNZperRow(const std::vector<int> &row_delimiters) {
   return maxNNZ;
 }
 
-__global__ void csrVectorKernel(const float *values, const int *cols,
-                                const int *row_delimiters, const float *x,
-                                float *output, int totalRows, int numThread) {
-  __shared__ float LDS[1024];
+// CSR-Vector Kernel
+__global__ void csrVectorKernel_group(const float *values, const int *cols,
+                                      const int *row_delimiters, const float *x,
+                                      float *output, int totalRows,
+                                      const int *rowBlocks, int groupID) {
+  __shared__ float LDS[NNZ_PER_WG];
 
-  int workgroupID = blockIdx.x;
   int localTid = threadIdx.x;
+  int startRow = rowBlocks[groupID];
+  int nextStartRow = rowBlocks[groupID + 1];
+  int numRows = nextStartRow - startRow;
+
+  int numNonZeroes = row_delimiters[nextStartRow] - row_delimiters[startRow];
+
+  // stride parallelism
+  for (int i = localTid; i < numNonZeroes; i += THREADS_PER_WG) {
+    int idx = row_delimiters[startRow] + i;
+    LDS[i] = values[idx] * x[cols[idx]];
+  }
+
+  __syncthreads(); // 同步确保LDS加载完成
+
+  // 每个线程对分配给它的行做归约
+  float sum = 0.0f;
+  // 注意：这里我们使用有效线程数：effectiveThreads = min(numRows,
+  // THREADS_PER_WG)
+  for (int r = localTid; r < numRows; r += THREADS_PER_WG) {
+    int base = row_delimiters[startRow];
+    int localStart = row_delimiters[startRow + r] - base;
+    int localEnd = row_delimiters[startRow + r + 1] - base;
+    float temp = 0.0f;
+    for (int j = localStart; j < localEnd; j++) {
+      temp += LDS[j];
+    }
+    // 将每行的结果写到输出中
+    output[startRow + r] = temp;
+  }
 }
 
 int main() {

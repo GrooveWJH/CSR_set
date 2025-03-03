@@ -5,7 +5,6 @@
 
 void readMatrixFromFile(const std::string &filename, std::vector<float> &values,
                         std::vector<int> &cols, std::vector<int> &row_delimiters) {
-  // Check if file exists before opening
   std::ifstream checkFile(filename);
   if (!checkFile.good()) {
     std::cerr << "File does not exist: " << filename << std::endl;
@@ -63,7 +62,6 @@ void readMatrixFromFile(const std::string &filename, std::vector<float> &values,
 std::vector<float> readVectorFromFile(const std::string &filename) {
     std::vector<float> vector;
     
-    // Check if file exists before opening
     std::ifstream checkFile(filename);
     if (!checkFile.good()) {
         std::cerr << "File does not exist: " << filename << std::endl;
@@ -76,7 +74,6 @@ std::vector<float> readVectorFromFile(const std::string &filename) {
     float value;
 
     if (file.is_open()) {
-        // Read the first line
         if (std::getline(file, line)) {
             std::istringstream iss(line);
             while (iss >> value) {

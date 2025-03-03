@@ -26,7 +26,14 @@ set_target_properties(csr_adaptive PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
-target_link_libraries(csr_adaptive PRIVATE CUDA::cudart)
+
+add_executable(cuSPARSE cuSPARSE.cu ${HELPER_SOURCES})
+set_target_properties(cuSPARSE PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
+target_link_libraries(cuSPARSE PRIVATE CUDA::cudart CUDA::cusparse)
 
 find_package(CUDAToolkit REQUIRED)
 
