@@ -56,7 +56,7 @@ def write_matrix_to_files(matrix, directory='./'):
         f.write(' '.join(f"{val:.6f}" for val in result) + '\n')
 
 def main():
-    matrix = generate_sparse_matrix(nnz_per_row=16, rows=1, cols=1023)
+    matrix = generate_sparse_matrix(nnz_per_row=16, rows=128, cols=32)
     result = calculate_result(matrix, np.arange(1, matrix.shape[1] + 1))
     print("Calculation result:")
     print(result)
