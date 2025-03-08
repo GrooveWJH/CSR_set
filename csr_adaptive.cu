@@ -4,7 +4,6 @@
 #include <cuda_runtime.h>
 #include <iostream>
 #include <ostream>
-#include <system_error>
 #include <vector>
 
 #define NNZ_PER_WG 1024
@@ -56,10 +55,49 @@ void calculateRowBlocks(int totalRows, const std::vector<int> &row_delimiters,
     }
     lastIdx = i;
   }
-  rowBlocks.push_back(totalRows); // 最后一个工作组结束于总行数
+  rowBlocks.push_back(totalRows);
 }
 
-// CSR-Vector Kernel
+// CSR-Vector Kernel - OG
+__global__ void csrVectorKernel_group(const float *values, const int *cols,
+                                      const int *row_delimiters, const float *x,
+                                      float *output, int totalRows,
+                                      const int *rowBlocks, int groupID) {
+  const int threadsPerRow = 32;         
+  int tid = threadIdx.x;                
+  int rowInGroup = tid / threadsPerRow; 
+  int lane = tid % threadsPerRow;       
+
+  int startRow = rowBlocks[groupID];         
+  int nextStartRow = rowBlocks[groupID + 1]; 
+  int numRows = nextStartRow - startRow;     
+  if (rowInGroup >= numRows)
+    return;
+
+  int globalRow = startRow + rowInGroup;
+  int rowStart = row_delimiters[globalRow];
+  int rowEnd = row_delimiters[globalRow + 1];
+  int nnz = rowEnd - rowStart;
+
+  // 每个线程计算自己的部分和：处理 lane, lane+32, lane+64, ... 下标处的元素
+  float partial = 0.0f;
+  for (int j = lane; j < nnz; j += threadsPerRow) {
+    int idx = rowStart + j;
+    partial += values[idx] * x[cols[idx]];
+  }
+
+  // warp内归约（使用 __shfl_down_sync）
+  for (int offset = threadsPerRow / 2; offset > 0; offset /= 2) {
+    partial += __shfl_down_sync(0xffffffff, partial, offset);
+  }
+
+  // 每行由 lane==0 的线程写入最终结果
+  if (lane == 0) {
+    output[globalRow] = partial;
+  }
+}
+
+// CSR-Vector Kernel - Large
 __global__ void csrVectorKernel_group_large(const float *values,
                                             const int *cols,
                                             const int *row_delimiters,
@@ -70,12 +108,13 @@ __global__ void csrVectorKernel_group_large(const float *values,
   int nextStartRow = rowBlocks[groupID + 1];
   int numRows = nextStartRow - startRow;
   int tid = threadIdx.x;
-  int rowInGroup = tid / maxNNZ; // 当前线程对应的组内行号
-  int colInRow = tid % maxNNZ;   // 当前线程在该行内的局部索引
+  int rowInGroup = tid / maxNNZ;
+  int colInRow = tid % maxNNZ;
+
   // 如果线程对应的行超出实际行数，直接返回
   if (rowInGroup >= numRows)
     return;
-  // 计算全局行号
+
   int globalRow = startRow + rowInGroup;
 
   int rowStart = row_delimiters[globalRow];
@@ -87,7 +126,7 @@ __global__ void csrVectorKernel_group_large(const float *values,
     atomicAdd(&output[globalRow], prod);
   }
 }
-// CSR-Vector Kernel
+// CSR-Vector Kernel - Stride (Even not called Vector)
 __global__ void
 csrVectorKernel_group_stride(const float *values, const int *cols,
                              const int *row_delimiters, const float *x,
@@ -108,12 +147,11 @@ csrVectorKernel_group_stride(const float *values, const int *cols,
     LDS[i] = values[idx] * x[cols[idx]];
   }
 
-  __syncthreads(); // 同步确保LDS加载完成
+  __syncthreads();
 
   // 每个线程对分配给它的行做归约
   float sum = 0.0f;
-  // 注意：这里我们使用有效线程数：effectiveThreads = min(numRows,
-  // THREADS_PER_WG)
+
   for (int r = localTid; r < numRows; r += THREADS_PER_WG) {
     int base = row_delimiters[startRow];
     int localStart = row_delimiters[startRow + r] - base;
@@ -122,7 +160,6 @@ csrVectorKernel_group_stride(const float *values, const int *cols,
     for (int j = localStart; j < localEnd; j++) {
       temp += LDS[j];
     }
-    // 将每行的结果写到输出中
     // printf("LDS[1025] = %f",LDS[1025]);
     output[startRow + r] = temp;
   }
@@ -202,9 +239,12 @@ __host__ void csrAdaptiveHost(const float *d_values, const int *d_cols,
             << numRows * maxNNZ << " threads\n";
         return;
       } else {
-        csrVectorKernel_group_large<<<1, numRows * maxNNZ>>>(
+        csrVectorKernel_group<<<1, numRows * 32>>>(
             d_values, d_cols, d_row_delimiters, d_x, d_output, totalRows,
-            d_rowBlocks, groupID, maxNNZ);
+            d_rowBlocks, groupID);
+        // csrVectorKernel_group_large<<<1, numRows * maxNNZ>>>(
+        //     d_values, d_cols, d_row_delimiters, d_x, d_output, totalRows,
+        //     d_rowBlocks, groupID, maxNNZ);
         // csrVectorKernel_group_stride<<<1, THREADS_PER_WG>>>(
         //     d_values, d_cols, d_row_delimiters, d_x, d_output, totalRows,
         //     d_rowBlocks, groupID);
@@ -260,8 +300,7 @@ int main() {
              cudaMemcpyHostToDevice);
 
   int numGroups = rowBlocks.size() - 1;
-  printf("create %d workgroups\n",
-         numGroups);
+  printf("create %d workgroups\n", numGroups);
 
   // CSR-Adaptive
   double adaptive_time = measureExecutionTime([&]() {
